@@ -2242,7 +2242,7 @@ bool subgroup_announce_check(struct bgp_dest *dest, struct bgp_path_info *pi,
 	}
 
 	/* AS path loop check. */
-	if (peer->as_path_loop_detection &&
+	if (CHECK_FLAG(peer->flags, PEER_FLAG_AS_LOOP_DETECTION) &&
 	    aspath_loop_check(piattr->aspath, peer->as)) {
 		if (bgp_debug_update(NULL, p, subgrp->update_group, 0))
 			zlog_debug(
@@ -2979,7 +2979,7 @@ void subgroup_process_announce_selected(struct update_subgroup *subgrp,
 {
 	const struct prefix *p;
 	struct peer *onlypeer;
-	struct attr attr;
+	struct attr attr = { 0 }, *pattr = &attr;
 	struct bgp *bgp;
 	bool advertise;
 
@@ -3007,26 +3007,30 @@ void subgroup_process_announce_selected(struct update_subgroup *subgrp,
 	advertise = bgp_check_advertise(bgp, dest, safi);
 
 	if (selected) {
-		if (subgroup_announce_check(dest, selected, subgrp, p, &attr,
+		if (subgroup_announce_check(dest, selected, subgrp, p, pattr,
 					    NULL)) {
 			/* Route is selected, if the route is already installed
 			 * in FIB, then it is advertised
 			 */
 			if (advertise) {
 				if (!bgp_check_withdrawal(bgp, dest, safi)) {
-					struct attr *adv_attr =
-						bgp_attr_intern(&attr);
-
-					bgp_adj_out_set_subgroup(dest, subgrp,
-								 adv_attr,
-								 selected);
-				} else
+					if (!bgp_adj_out_set_subgroup(dest,
+								      subgrp,
+								      pattr,
+								      selected))
+						bgp_attr_flush(pattr);
+				} else {
 					bgp_adj_out_unset_subgroup(
 						dest, subgrp, 1, addpath_tx_id);
-			}
-		} else
+					bgp_attr_flush(pattr);
+				}
+			} else
+				bgp_attr_flush(pattr);
+		} else {
 			bgp_adj_out_unset_subgroup(dest, subgrp, 1,
 						   addpath_tx_id);
+			bgp_attr_flush(pattr);
+		}
 	}
 
 	/* If selected is NULL we must withdraw the path using addpath_tx_id */
@@ -6006,10 +6010,10 @@ bool bgp_outbound_policy_exists(struct peer *peer, struct bgp_filter *filter)
 	if (peer->sort == BGP_PEER_IBGP)
 		return true;
 
-	if (peer->sort == BGP_PEER_EBGP
-	    && (ROUTE_MAP_OUT_NAME(filter) || PREFIX_LIST_OUT_NAME(filter)
-		|| FILTER_LIST_OUT_NAME(filter)
-		|| DISTRIBUTE_OUT_NAME(filter)))
+	if (peer->sort == BGP_PEER_EBGP &&
+	    (ROUTE_MAP_OUT_NAME(filter) || PREFIX_LIST_OUT_NAME(filter) ||
+	     FILTER_LIST_OUT_NAME(filter) || DISTRIBUTE_OUT_NAME(filter) ||
+	     UNSUPPRESS_MAP_NAME(filter)))
 		return true;
 	return false;
 }
@@ -6286,13 +6290,14 @@ static void bgp_nexthop_reachability_check(afi_t afi, safi_t safi,
 					   struct bgp_path_info *bpi,
 					   const struct prefix *p,
 					   struct bgp_dest *dest,
-					   struct bgp *bgp)
+					   struct bgp *bgp,
+					   struct bgp *bgp_nexthop)
 {
 	/* Nexthop reachability check. */
 	if (safi == SAFI_UNICAST || safi == SAFI_LABELED_UNICAST) {
 		if (CHECK_FLAG(bgp->flags, BGP_FLAG_IMPORT_CHECK)) {
-			if (bgp_find_or_add_nexthop(bgp, bgp, afi, safi, bpi,
-						    NULL, 0, p))
+			if (bgp_find_or_add_nexthop(bgp, bgp_nexthop, afi, safi,
+						    bpi, NULL, 0, p))
 				bgp_path_info_set_flag(dest, bpi,
 						       BGP_PATH_VALID);
 			else {
@@ -6350,6 +6355,7 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 	mpls_label_t label = 0;
 #endif
 	uint32_t num_labels = 0;
+	struct bgp *bgp_nexthop = bgp;
 
 	assert(bgp_static);
 
@@ -6504,9 +6510,11 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 						&pi->extra->label[0]);
 			}
 #endif
+			if (pi->extra && pi->extra->vrfleak->bgp_orig)
+				bgp_nexthop = pi->extra->vrfleak->bgp_orig;
 
 			bgp_nexthop_reachability_check(afi, safi, pi, p, dest,
-						       bgp);
+						       bgp, bgp_nexthop);
 
 			/* Process change. */
 			bgp_aggregate_increment(bgp, p, pi, afi, safi);
@@ -6556,7 +6564,7 @@ void bgp_static_update(struct bgp *bgp, const struct prefix *p,
 #endif
 	}
 
-	bgp_nexthop_reachability_check(afi, safi, new, p, dest, bgp);
+	bgp_nexthop_reachability_check(afi, safi, new, p, dest, bgp, bgp);
 
 	/* Aggregate address increment. */
 	bgp_aggregate_increment(bgp, p, new, afi, safi);
@@ -9038,6 +9046,9 @@ static void route_vty_short_status_out(struct vty *vty,
 		vty_out(vty, "i");
 	else
 		vty_out(vty, " ");
+
+	/* adding space between next column */
+	vty_out(vty, " ");
 }
 
 static char *bgp_nexthop_hostname(struct peer *peer,
